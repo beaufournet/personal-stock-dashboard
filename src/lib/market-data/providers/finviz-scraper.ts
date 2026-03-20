@@ -2,6 +2,16 @@ import { buildCoverageNotes } from "@/lib/market-data/coverage-notes";
 import { MarketDataProvider, ProviderResult } from "@/lib/market-data/types";
 import { MarketStockMetrics } from "@/types/stocks";
 
+const FINVIZ_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const FINVIZ_CONCURRENCY = 2;
+
+type CachedEntry = {
+  fetchedAt: number;
+  metrics: MarketStockMetrics;
+};
+
+const finvizCache = new Map<string, CachedEntry>();
+
 function stripHtml(value: string): string {
   return value
     .replace(/<[^>]+>/g, " ")
@@ -79,9 +89,37 @@ function extractSnapshotMap(html: string): Record<string, string> {
   return pairs;
 }
 
+function isFresh(entry: CachedEntry | undefined): boolean {
+  return Boolean(entry && Date.now() - entry.fetchedAt < FINVIZ_CACHE_TTL_MS);
+}
+
+async function mapWithConcurrency<TItem>(
+  items: string[],
+  concurrency: number,
+  worker: (item: string) => Promise<TItem>
+): Promise<TItem[]> {
+  const results = new Array<TItem>(items.length);
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await worker(items[currentIndex]);
+      }
+    })
+  );
+
+  return results;
+}
+
 async function fetchHtml(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: {
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      Referer: "https://finviz.com/",
       "User-Agent": "Mozilla/5.0"
     },
     cache: "no-store"
@@ -102,87 +140,103 @@ export class FinvizScraperProvider implements MarketDataProvider {
     const stocks: Record<string, MarketStockMetrics> = {};
     const coverageFieldSet = new Set<string>();
 
-    await Promise.all(
-      uniqueTickers.map(async (ticker) => {
-        try {
-          const html = await fetchHtml(`https://finviz.com/quote.ashx?t=${encodeURIComponent(ticker)}&p=d`);
-          const snapshot = extractSnapshotMap(html);
-          const shortFloatPct = parsePercent(snapshot["Short Float"] ?? "");
-          const sharesFloat = parseNumber(snapshot["Shs Float"] ?? "");
-          const sharesOutstanding = parseNumber(snapshot["Shs Outstand"] ?? "");
-          const trailingDividendYield = parsePercent(snapshot["Dividend TTM"] ?? "");
-          const forwardDividendYield = parsePercent(snapshot["Dividend Est."] ?? "");
-          const nextEarningsDate = parseNextEarningsDate(snapshot["Earnings"] ?? "");
+    await mapWithConcurrency(uniqueTickers, FINVIZ_CONCURRENCY, async (ticker) => {
+      const staleCacheEntry = finvizCache.get(ticker);
+      if (staleCacheEntry && isFresh(staleCacheEntry)) {
+        stocks[ticker] = staleCacheEntry.metrics;
+        staleCacheEntry.metrics.missingFields.forEach((field) => coverageFieldSet.add(field));
+        return;
+      }
 
-          const metrics: MarketStockMetrics = {
-            ticker,
-            currentPrice: null,
-            percentChangeFromYesterday: null,
-            fiftyTwoWeekHigh: null,
-            fiftyTwoWeekLow: null,
-            trailingPe: parseNumber(snapshot["P/E"] ?? ""),
-            forwardPe: parseNumber(snapshot["Forward P/E"] ?? ""),
-            evToEbitda: parseNumber(snapshot["EV/EBITDA"] ?? ""),
-            trailingDividendYield,
-            forwardDividendYield,
-            exDividendDate: parseDateWithCurrentYear(snapshot["Dividend Ex-Date"] ?? ""),
-            shortInterestPctOfFloat: shortFloatPct,
-            shortInterestPctOfTotalShares:
-              shortFloatPct !== null && sharesFloat !== null && sharesOutstanding !== null && sharesOutstanding > 0
-                ? shortFloatPct * (sharesFloat / sharesOutstanding)
-                : null,
-            nextEarningsDate,
-            performance1Month: null,
-            performance3Months: null,
-            performance12Months: parsePercent(snapshot["Perf Year"] ?? ""),
-            missingFields: [],
-            error: null
-          };
+      try {
+        const html = await fetchHtml(`https://finviz.com/quote.ashx?t=${encodeURIComponent(ticker)}&p=d`);
+        const snapshot = extractSnapshotMap(html);
+        const shortFloatPct = parsePercent(snapshot["Short Float"] ?? "");
+        const sharesFloat = parseNumber(snapshot["Shs Float"] ?? "");
+        const sharesOutstanding = parseNumber(snapshot["Shs Outstand"] ?? "");
+        const trailingDividendYield = parsePercent(snapshot["Dividend TTM"] ?? "");
+        const forwardDividendYield = parsePercent(snapshot["Dividend Est."] ?? "");
+        const nextEarningsDate = parseNextEarningsDate(snapshot["Earnings"] ?? "");
 
-          metrics.missingFields = Object.entries(metrics)
-            .filter(([key, value]) => !["ticker", "missingFields", "error"].includes(key) && value === null)
-            .map(([key]) => key);
+        const metrics: MarketStockMetrics = {
+          ticker,
+          currentPrice: null,
+          percentChangeFromYesterday: null,
+          fiftyTwoWeekHigh: null,
+          fiftyTwoWeekLow: null,
+          trailingPe: parseNumber(snapshot["P/E"] ?? ""),
+          forwardPe: parseNumber(snapshot["Forward P/E"] ?? ""),
+          evToEbitda: parseNumber(snapshot["EV/EBITDA"] ?? ""),
+          trailingDividendYield,
+          forwardDividendYield,
+          exDividendDate: parseDateWithCurrentYear(snapshot["Dividend Ex-Date"] ?? ""),
+          shortInterestPctOfFloat: shortFloatPct,
+          shortInterestPctOfTotalShares:
+            shortFloatPct !== null && sharesFloat !== null && sharesOutstanding !== null && sharesOutstanding > 0
+              ? shortFloatPct * (sharesFloat / sharesOutstanding)
+              : null,
+          nextEarningsDate,
+          performance1Month: null,
+          performance3Months: null,
+          performance12Months: parsePercent(snapshot["Perf Year"] ?? ""),
+          missingFields: [],
+          error: null
+        };
 
-          metrics.missingFields.forEach((field) => coverageFieldSet.add(field));
-          stocks[ticker] = metrics;
-        } catch (error) {
-          stocks[ticker] = {
-            ticker,
-            currentPrice: null,
-            percentChangeFromYesterday: null,
-            fiftyTwoWeekHigh: null,
-            fiftyTwoWeekLow: null,
-            trailingPe: null,
-            forwardPe: null,
-            evToEbitda: null,
-            trailingDividendYield: null,
-            forwardDividendYield: null,
-            exDividendDate: null,
-            shortInterestPctOfFloat: null,
-            shortInterestPctOfTotalShares: null,
-            nextEarningsDate: null,
-            performance1Month: null,
-            performance3Months: null,
-            performance12Months: null,
-            missingFields: [
-              "trailingPe",
-              "forwardPe",
-              "evToEbitda",
-              "trailingDividendYield",
-              "forwardDividendYield",
-              "exDividendDate",
-              "shortInterestPctOfFloat",
-              "shortInterestPctOfTotalShares",
-              "nextEarningsDate",
-              "performance12Months"
-            ],
-            error: error instanceof Error ? error.message : "Unknown fallback provider error"
-          };
+        metrics.missingFields = Object.entries(metrics)
+          .filter(([key, value]) => !["ticker", "missingFields", "error"].includes(key) && value === null)
+          .map(([key]) => key);
 
-          stocks[ticker].missingFields.forEach((field) => coverageFieldSet.add(field));
+        finvizCache.set(ticker, {
+          fetchedAt: Date.now(),
+          metrics
+        });
+
+        metrics.missingFields.forEach((field) => coverageFieldSet.add(field));
+        stocks[ticker] = metrics;
+      } catch (error) {
+        if (staleCacheEntry) {
+          stocks[ticker] = staleCacheEntry.metrics;
+          staleCacheEntry.metrics.missingFields.forEach((field) => coverageFieldSet.add(field));
+          return;
         }
-      })
-    );
+
+        stocks[ticker] = {
+          ticker,
+          currentPrice: null,
+          percentChangeFromYesterday: null,
+          fiftyTwoWeekHigh: null,
+          fiftyTwoWeekLow: null,
+          trailingPe: null,
+          forwardPe: null,
+          evToEbitda: null,
+          trailingDividendYield: null,
+          forwardDividendYield: null,
+          exDividendDate: null,
+          shortInterestPctOfFloat: null,
+          shortInterestPctOfTotalShares: null,
+          nextEarningsDate: null,
+          performance1Month: null,
+          performance3Months: null,
+          performance12Months: null,
+          missingFields: [
+            "trailingPe",
+            "forwardPe",
+            "evToEbitda",
+            "trailingDividendYield",
+            "forwardDividendYield",
+            "exDividendDate",
+            "shortInterestPctOfFloat",
+            "shortInterestPctOfTotalShares",
+            "nextEarningsDate",
+            "performance12Months"
+          ],
+          error: error instanceof Error ? error.message : "Unknown fallback provider error"
+        };
+
+        stocks[ticker].missingFields.forEach((field) => coverageFieldSet.add(field));
+      }
+    });
 
     return {
       provider: this.name,
