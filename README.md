@@ -2,6 +2,12 @@
 
 A beginner-friendly stock dashboard built with Next.js. It stores your rows in the browser, refreshes market data every 60 seconds, and keeps the market-data code separate from the UI code so you can swap providers later.
 
+## Live Site
+
+- Production website: https://personal-stock-dashboard-kswx.vercel.app/
+- Source code: https://github.com/beaufournet/personal-stock-dashboard
+- Recommended setup: keep the code in GitHub and use Vercel as the live host for the site.
+
 ## Why This Stack
 
 - `Next.js` gives you one project for both the web UI and the API route.
@@ -74,7 +80,8 @@ http://localhost:3000
 5. Vercel should detect `Next.js` automatically.
 6. Leave the default build settings as-is.
 7. Click `Deploy`.
-8. When deployment finishes, open the Vercel URL.
+8. When deployment finishes, use the Vercel URL as the website link.
+9. For this project, GitHub is the code host and Vercel is the correct production host.
 
 ## Important Notes About Data Coverage
 
