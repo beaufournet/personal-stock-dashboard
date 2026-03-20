@@ -4,7 +4,7 @@ A beginner-friendly stock dashboard built with Next.js. It stores your rows in t
 
 ## Live Site
 
-- Production website: https://personal-stock-dashboard-kswx.vercel.app/
+- Production website: https://personal-stock-dashboard.vercel.app/
 - Source code: https://github.com/beaufournet/personal-stock-dashboard
 - Recommended setup: keep the code in GitHub and use Vercel as the live host for the site.
 
